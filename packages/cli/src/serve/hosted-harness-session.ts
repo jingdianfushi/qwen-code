@@ -126,6 +126,10 @@ import {
 } from './hosted-agent-definition.js';
 import { runHostedHarnessTextTurn } from './hosted-harness-model.js';
 import {
+  HostedSkillCatalog,
+  readHostedSkills,
+} from './hosted-skill-catalog.js';
+import {
   parseHostedWorkflowLaunchBlock,
   runHostedWorkflowTurn,
   workflowLaunchSummaryText,
@@ -340,6 +344,7 @@ interface HostedSession {
   storeBaseUrl: string;
   definition: Record<string, unknown> | null;
   agentDefinition?: HostedAgentDefinition;
+  skills?: HostedSkillCatalog;
   clientId: string;
   cwd: string;
   streams: Set<() => void>;
@@ -2113,6 +2118,10 @@ async function verifyWorkspaceRestore(
         await readRef(pin.instructionsRef);
         await readHostedAgentInstructions(pin, resources);
       }
+      if (pin?.skillsRef) {
+        await readRef(pin.skillsRef);
+        await readHostedSkills(pin.skillsRef, resources);
+      }
     }
     if (ref.kind === 'managed-tool-outcome') {
       const outcome = object(JSON.parse(bytes.toString('utf8')));
@@ -3069,6 +3078,7 @@ async function executeHostedTurn(
                 {
                   mcp: session.mcp,
                   hooks: session.hooks,
+                  skills: session.skills,
                   profile: session.toolProfile,
                   context: workspaceContext,
                   childRuns: session.childRuns,
@@ -3140,6 +3150,7 @@ async function executeHostedTurn(
                     session.agentDefinition,
                     session.managed.resources,
                   ),
+                  skills: session.skills,
                   ...(session.hooks ? { hooks: session.hooks } : {}),
                   ...(toolTurn ? { toolTurn } : {}),
                   ...(resumeFromToolResults ? { resumeFromToolResults } : {}),
@@ -3401,10 +3412,12 @@ export function registerHostedHarnessSessionRoutes(
     let toolProfile = body?.['toolProfile'];
     let captureBytes = body?.['captureBytes'];
     if (
-      toolProfile !== undefined &&
-      ((!isHostedWorkspaceProfile(toolProfile) &&
-        toolProfile !== HOSTED_MCP_PROFILE) ||
-        !brokerOptions)
+      (agentDefinition?.skillsRef !== undefined &&
+        (!toolProfile || !brokerOptions)) ||
+      (toolProfile !== undefined &&
+        ((!isHostedWorkspaceProfile(toolProfile) &&
+          toolProfile !== HOSTED_MCP_PROFILE) ||
+          !brokerOptions))
     ) {
       error(res, 400, 'hosted_tool_profile_unavailable');
       return;
@@ -4200,6 +4213,7 @@ export function registerHostedHarnessSessionRoutes(
         ),
       );
       let savedAgentDefinition: HostedAgentDefinition | undefined;
+      let skills: HostedSkillCatalog | undefined;
       try {
         savedAgentDefinition = parseHostedAgentDefinition(
           definition?.['agentDefinition'],
@@ -4210,6 +4224,13 @@ export function registerHostedHarnessSessionRoutes(
           savedAgentDefinition,
           managed.resources,
         );
+        if (savedAgentDefinition?.skillsRef)
+          skills = new HostedSkillCatalog(
+            await readHostedSkills(
+              savedAgentDefinition.skillsRef,
+              managed.resources,
+            ),
+          );
       } catch {
         await managed.close();
         error(res, 409, 'hosted_agent_definition_conflict');
@@ -4247,7 +4268,8 @@ export function registerHostedHarnessSessionRoutes(
         captureBytes = definition?.['captureBytes'];
       const workspaceProfile = isHostedWorkspaceProfile(toolProfile);
       if (
-        (hookCatalog !== undefined && (!toolProfile || !brokerOptions)) ||
+        ((hookCatalog !== undefined || skills !== undefined) &&
+          (!toolProfile || !brokerOptions)) ||
         (toolProfile !== undefined &&
           ((!isHostedWorkspaceProfile(toolProfile) &&
             toolProfile !== HOSTED_MCP_PROFILE) ||
@@ -4274,6 +4296,7 @@ export function registerHostedHarnessSessionRoutes(
         storeBaseUrl: store.baseUrl,
         definition,
         agentDefinition: savedAgentDefinition,
+        ...(skills ? { skills } : {}),
         clientId: randomUUID(),
         cwd,
         streams: new Set(),
@@ -4916,6 +4939,8 @@ export function registerHostedHarnessSessionRoutes(
             sessionId,
             cwd,
             promptId: unsettled,
+            skills: session.skills,
+            hooks: session.hooks,
             children: session.childAgents,
             teams: session.teams,
             messages: session.messages,
@@ -5153,6 +5178,59 @@ export function registerHostedHarnessSessionRoutes(
           }
         }
       }
+      if (
+        takeover &&
+        unsettled &&
+        session.skills &&
+        !resume &&
+        !resumeApproval &&
+        !committedModelOutput &&
+        body?.['cancellationTakeover'] !== true &&
+        (await parkNeedsNoRuntimeSettlement(managed))
+      ) {
+        const current = (await managed.sink.project()).filter(
+          (record) => record.daemonPromptId === unsettled,
+        );
+        const assistant = current.findLast(
+          (record) => record.type === 'assistant',
+        );
+        const calls = assistant?.message?.parts?.flatMap((part) =>
+          part.functionCall ? [part.functionCall] : [],
+        );
+        if (calls?.length && calls.every((call) => call.name === 'skill')) {
+          await answerResumedTurnCalls({
+            session: managed,
+            sessionId,
+            cwd,
+            promptId: unsettled,
+            skills: session.skills,
+            hooks: session.hooks,
+          });
+          const projected = (await managed.sink.project()).filter(
+            (record) => record.daemonPromptId === unsettled,
+          );
+          const user = projected.find((record) => record.type === 'user');
+          const text = user?.message?.parts
+            ?.flatMap((part) =>
+              typeof part.text === 'string' ? [part.text] : [],
+            )
+            .join('\n');
+          if (!text)
+            throw new HostedToolRecoveryRequiredError(
+              'Original Skill Prompt is missing.',
+            );
+          const lastAssistant = projected.findLastIndex(
+            (record) => record.type === 'assistant',
+          );
+          resume = {
+            promptId: unsettled,
+            text,
+            parts: projected
+              .slice(lastAssistant + 1)
+              .flatMap((record) => record.message?.parts ?? []),
+          };
+        }
+      }
       let settlePromptId: string | undefined = committedModelOutput?.promptId;
       let recovery: HostedRuntimeRecoveryReport | undefined;
       // A takeover that answers inapplicable has spoken: the plain attach
@@ -5164,6 +5242,7 @@ export function registerHostedHarnessSessionRoutes(
         takeover &&
         !resumeApproval &&
         !resumeModel &&
+        !resume &&
         !settlePromptId
       ) {
         // A parked Runtime turn is taken over, not refused: settle its
@@ -5382,6 +5461,8 @@ export function registerHostedHarnessSessionRoutes(
             sessionId,
             cwd,
             promptId,
+            skills: session.skills,
+            hooks: session.hooks,
             children: session.childAgents,
             teams: session.teams,
             messages: session.messages,
@@ -8034,6 +8115,7 @@ export function registerHostedHarnessSessionRoutes(
           },
           {
             mcp: session.mcp,
+            skills: session.skills,
             profile: session.toolProfile,
             context: workspaceContext,
             childRuns: session.childRuns,
@@ -8106,6 +8188,8 @@ export function registerHostedHarnessSessionRoutes(
               gapText: HOSTED_AGENT_CALL_NOT_REACHED_TEXT,
               children: session.childAgents,
               messages: session.messages,
+              skills: session.skills,
+              hooks: session.hooks,
               signal: abort.signal,
               consume: (childRunId) => session.childConsumption.add(childRunId),
             });
@@ -8178,6 +8262,8 @@ export function registerHostedHarnessSessionRoutes(
             sessionId,
             cwd: session.cwd,
             promptId,
+            skills: session.skills,
+            hooks: session.hooks,
             children: session.childAgents,
             teams: session.teams,
             messages: session.messages,
@@ -8258,6 +8344,7 @@ export function registerHostedHarnessSessionRoutes(
               session.agentDefinition,
               session.managed.resources,
             ),
+            skills: session.skills,
             toolTurn,
             resumeFromToolResults: resumeParts,
             textDeltas: deltas,
