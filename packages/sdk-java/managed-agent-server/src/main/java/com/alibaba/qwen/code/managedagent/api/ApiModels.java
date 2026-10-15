@@ -98,7 +98,15 @@ public final class ApiModels {
             boolean workspaceTurns, boolean sessionClose, boolean sessionArchive,
             boolean sessionUnarchive, boolean sessionDelete, boolean cwdChange,
             @JsonInclude(JsonInclude.Include.NON_NULL) Boolean foregroundShell,
-            @JsonInclude(JsonInclude.Include.NON_NULL) Boolean modelChange) {
+            @JsonInclude(JsonInclude.Include.NON_NULL) Boolean modelChange,
+            @JsonInclude(JsonInclude.Include.NON_NULL) Boolean approvalModeChange) {
+        public WebShellSessionCapabilities(boolean tasks, boolean artifacts, boolean actions,
+                boolean workspaceTurns, boolean sessionClose, boolean sessionArchive,
+                boolean sessionUnarchive, boolean sessionDelete, boolean cwdChange,
+                Boolean foregroundShell, Boolean modelChange) {
+            this(tasks, artifacts, actions, workspaceTurns, sessionClose, sessionArchive,
+                    sessionUnarchive, sessionDelete, cwdChange, foregroundShell, modelChange, null);
+        }
         public WebShellSessionCapabilities(boolean tasks, boolean artifacts, boolean actions,
                 boolean workspaceTurns, boolean sessionClose, boolean sessionArchive,
                 boolean sessionUnarchive, boolean sessionDelete, boolean cwdChange,
@@ -259,6 +267,22 @@ public final class ApiModels {
     public record WebShellSessionOptions(String approvalMode, List<String> availableApprovalModes) {
     }
 
+    public record WebShellApprovalSelection(String mode, long revision) {}
+
+    public record WebShellSessionApproval(String approvalMode, long approvalRevision,
+            List<String> availableApprovalModes, boolean supported) {}
+
+    public record WebShellSessionApprovalRequest(@NotBlank @Size(max = 128) String sessionId) {}
+
+    public record WebShellChangeApprovalRequest(@Size(max = 128) String requestId,
+            @NotBlank @Size(max = 128) String sessionId,
+            @NotBlank @Size(max = 128) String idempotencyKey,
+            @NotBlank String approvalMode,
+            @NotNull @Min(0) @Max(9_007_199_254_740_991L) Long expectedRevision) {}
+
+    public record WebShellApprovalChangeResult(String sessionId, String approvalMode,
+            long approvalRevision, boolean replayed) {}
+
     public record WebShellModelOption(String modelId, String label) {}
 
     @JsonInclude(JsonInclude.Include.NON_NULL)
@@ -406,7 +430,17 @@ public final class ApiModels {
             WebShellTurn activeTurn, Object environment, long lastSequence,
             WebShellWorkspace workspace,
             WebShellSessionCapabilities capabilities, String approvalMode,
-            WebShellModelContext modelContext, WebShellModelSelection modelSelection) {
+            WebShellModelContext modelContext, WebShellModelSelection modelSelection,
+            Long approvalRevision, String initialApprovalMode) {
+        public WebShellSession(String sessionId, String title, String agentId,
+                String status, long createdAt, long updatedAt, WebShellTurn activeTurn,
+                Object environment, long lastSequence, WebShellWorkspace workspace,
+                WebShellSessionCapabilities capabilities, String approvalMode,
+                WebShellModelContext modelContext, WebShellModelSelection modelSelection) {
+            this(sessionId, title, agentId, status, createdAt, updatedAt, activeTurn,
+                    environment, lastSequence, workspace, capabilities, approvalMode,
+                    modelContext, modelSelection, null, null);
+        }
         public WebShellSession(String sessionId, String title, String agentId,
                 String status, long createdAt, long updatedAt, WebShellTurn activeTurn,
                 Object environment, long lastSequence, WebShellWorkspace workspace,
